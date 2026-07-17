@@ -5,8 +5,8 @@ Unravelling novel metabolites in beef exudate to ensure meat freshness and safet
 Bioinformatics team - Horizon Science Communication LLC
 https://www.horizon-sci-comm.us/bioinformatics-services
 
-- Abeer Farag, PhD  
-- Hesham Abdullah, PhD  
+- Hesham Abdullah, PhD 
+- Abeer Farag, PhD    
 - Ahmed Abdelmaksoud
 - Mai Mohamed Salah
 
