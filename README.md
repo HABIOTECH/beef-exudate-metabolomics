@@ -29,6 +29,11 @@ Principal finding: exudate shows more pronounced treatment-specific divergence
 and clearer biomarker signals than tissue, supporting non-destructive sampling as a
 viable — and possibly more sensitive — route to spoilage surveillance.
 
+**Project Overview*
+<p align="center">
+  <img src="Metabolite_analysis_pipeline.png" alt="RNA-seq pipeline" width="900">
+</p>
+
 **Pipeline**
 
 1. Experimental design. Paired tissue and exudate matrices; contaminated
@@ -57,10 +62,7 @@ saw during training and cannot succeed by memorizing the temporal pattern.
 6. Annotation confidence. All reported features carry an MSI confidence level
 assigned by R/msi_classifier.R (see below).
 
-**Metabolite analysis pipeline diagram**
-<p align="center">
-  <img src="Metabolite_analysis_pipeline.png" alt="RNA-seq pipeline" width="900">
-</p>
+
 
 
 
