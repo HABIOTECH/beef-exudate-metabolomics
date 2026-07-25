@@ -60,7 +60,9 @@ leave-one-day-out validation, so models are tested on storage days they never
 saw during training and cannot succeed by memorizing the temporal pattern.
 
 6. Annotation confidence. All reported features carry an MSI confidence level
-assigned by R/msi_classifier.R (see below).
+assigned by R/msi_classifier.R (see attached R code).
+
+
 
 
 
