@@ -62,6 +62,10 @@ saw during training and cannot succeed by memorizing the temporal pattern.
 6. Annotation confidence. All reported features carry an MSI confidence level
 assigned by R/msi_classifier.R (see attached R code).
 
+**Metabolite Identification workflow*
+<p align="center">
+  <img src="Metabolite_Identification_steps.png" alt="Metabolite Identification workflow" width="900">
+</p>
 
 
 
