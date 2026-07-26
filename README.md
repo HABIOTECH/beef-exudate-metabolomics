@@ -103,6 +103,7 @@ Sample-intensity columns are retained unchanged throughout the pipeline and re-m
 **Install everything in one call:
 **install.packages(c("dplyr", "tidyr", "readr", "readxl", "writexl", "xml2", "stringr"))
 
+See [PIPELINE_SOP.md](PIPELINE_SOP.md) for the full annotation method.
 
 
 
