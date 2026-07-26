@@ -104,9 +104,6 @@ Sample-intensity columns are retained unchanged throughout the pipeline and re-m
 **install.packages(c("dplyr", "tidyr", "readr", "readxl", "writexl", "xml2", "stringr"))
 
 
-<img width="468" height="621" alt="image" src="https://github.com/user-attachments/assets/ce8d5c18-3ddb-4fd6-9eaa-868765190efb" />
-
-
 
 
 
