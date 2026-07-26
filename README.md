@@ -106,6 +106,51 @@ Sample-intensity columns are retained unchanged throughout the pipeline and re-m
 See [PIPELINE_SOP.md](PIPELINE_SOP.md) for the full annotation method.
 
 
+# Statistical analysis and visualization (`python/metabolomics_pipeline.py`)
+
+Once features are annotated, the statistical analysis is run by a single,
+self-contained Python script — the code behind the preprocessing, univariate,
+temporal, and multivariate stages of the study.
+
+```bash
+python python/metabolomics_pipeline.py
+```
+
+The script takes no command-line arguments. It is configured by editing the
+`COMPARISONS` dictionary and the threshold block at the top of the file. Each
+comparison points at a metabolite table and a metadata table (CSV or Excel) plus
+a treatment/control label pair; the script loops over every comparison and skips
+any whose input files are missing rather than failing. Key thresholds — zero
+filter (40%), fold-change (|log2FC| > 0.5), p-value (0.05), cluster count,
+random-forest tree count, and permutation count — are exposed as named constants
+for easy adjustment.
+
+**Per comparison, the pipeline runs:**
+
+- **Preprocessing** — features with >40% zeros are filtered, remaining zeros
+  receive half-minimum imputation, then Log2 transformation and Pareto scaling
+  (÷√SD). A QC figure documents the skewness correction from raw → Log2 → scaled.
+- **Univariate analysis** — per-timepoint volcano plots (Welch t-test,
+  p < 0.05 and |log2FC| > 0.5) with automatically placed metabolite labels, plus
+  a Cohen's *d* effect-size summary by day.
+- **Temporal pattern discovery** — a top-50-feature clustermap heatmap and
+  k-means clustering of metabolic trajectories across the storage window.
+- **Multivariate modeling** — random forest classification (500 trees) scored by
+  5-fold cross-validated ROC-AUC with feature importances; PCA (global, scree,
+  and per-day); and PLS-DA with VIP scores and a permutation test yielding an
+  empirical p-value on Q².
+
+**Outputs.** PNG figures (volcano plots at 300 dpi, all others at 200 dpi) and
+one Excel workbook per comparison — with sheets for preprocessing QC, a volcano
+summary, per-day up/down/all feature tables, random-forest importances, and
+PLS-DA VIP scores — written to the folder named in `OUTPUT_DIR`.
+
+**Requirements:** Python ≥ 3.9 with `pandas`, `numpy`, `matplotlib`, `seaborn`,
+`scipy`, `scikit-learn`, `adjustText`, and `openpyxl`:
+
+```bash
+pip install pandas numpy matplotlib seaborn scipy scikit-learn adjustText openpyxl
+```
 
 
 
