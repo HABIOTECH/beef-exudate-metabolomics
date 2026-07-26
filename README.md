@@ -10,6 +10,36 @@ https://www.horizon-sci-comm.us/bioinformatics-services
 - Ahmed Abdelmaksoud
 - Mai Mohamed Salah
 
+## Repository structure
+
+The repository is organized as a flat layout. Files group into four logical sets:
+the R annotation pipeline (Steps 1–6), the R MSI classifier, the Python analysis
+pipeline, and documentation/figures.
+
+```
+beef-exudate-metabolomics/
+├── README.md                          # this file
+├── PIPELINE_SOP.md                    # full annotation-pipeline SOP
+│
+│   # R — annotation / identification pipeline (run in order)
+├── 01_feature_cleaning.R              # remove contaminants, adducts/isotopes, polymers
+├── 02_neutral_mass.R                  # convert observed m/z to neutral mass
+├── 03_database_matching.R             # match against HMDB + IDEOM at 10 ppm
+├── 04_best_hit_isomers.R              # lowest-ppm hit selection; isomer merging
+├── 05_batch_integration.R            # apply identifications across all cohorts
+├── 06_golden_list.R                   # extract significant target metabolites
+│
+│   # R — annotation confidence
+├── msi_classifier (2).R               # assign MSI confidence levels (2–4)
+│
+│   # Python — statistical analysis & visualization
+├── metabolomics_pipeline.py           # preprocessing, stats, ML, figures
+│
+│   # Figures / documentation assets
+├── Metabolite_Identification_steps.png
+└── Metabolite_analysis_pipeline.png
+```
+
 
 **Overview**
 
