@@ -68,10 +68,12 @@ assigned by R/msi_classifier.R (see attached R code).
   <img src="Metabolite_Identification_steps.png" alt="Metabolite Identification workflow" width="900">
 </p>
 
-1. Overview
+1. **Overview**
+
 This document describes the end-to-end computational pipeline used in our Homics lab for annotating untargeted LC-MS metabolomics features acquired in positive ionization mode on high-resolution mass spectrometers (Orbitrap, Q-TOF). The pipeline takes a raw feature table exported from peak-picking software (e.g., MS-DIAL, MZmine) and returns a curated, biologically meaningful identification table linked to HMDB and IDEOM metadata.
 It is written to serve two purposes simultaneously: as an internal Standard Operating Procedure to standardize how future projects are handled by the team, and as a README for the R code base that implements each step. Every stage below specifies its inputs, outputs, parameters, scientific rationale, and the exact R code that executes it.
-1.1 Pipeline at a glance
+
+**1.1 Pipeline at a glance**
 Step	Stage	Purpose	Primary output
 1	Feature cleaning	Remove contaminants, redundant adducts/isotopes, polymers	Combined_Annotated_Metabolites.csv
 2	Neutral mass recovery	Convert observed m/z to monoisotopic neutral mass	Data_with_Neutral_Mass.xlsx
@@ -82,23 +84,26 @@ Step	Stage	Purpose	Primary output
 
 
 
-1.2 Input data requirements
+**1.2 Input data requirements**
 The pipeline assumes a single feature table per cohort (one .xlsx file) exported from the peak-picking tool. The following columns are required (names must match exactly — they are referenced literally in the code):
-•	Alignment ID — unique integer identifier for each feature.
-•	Average Mz — observed mass-to-charge ratio.
-•	Average Rt(min) — retention time in minutes.
-•	Adduct type — adduct assignment string, e.g. [M+H]+, [M+Na]+, [M+NH4]+.
-Sample-intensity columns are retained unchanged throughout the pipeline and re-merged with identifications at the reporting stage.
-1.3 Software environment
-Language	R (≥ 4.2.0)
-CRAN packages	dplyr, tidyr, readr, readxl, writexl, xml2, stringr
-External DBs	HMDB (hmdb_metabolites.xml, ~6 GB uncompressed) and IDEOM reference file (DB.xlsx)
-Contaminant DBs	stanstrup/commonMZ (contaminants_+.tsv, repeating_units_+.tsv) fetched live from GitHub
-RAM	≥ 8 GB recommended (Part 1 uses a streaming XML parser to keep memory below 1 GB)
+•	**Alignment ID** — unique integer identifier for each feature.
+•	**Average Mz** — observed mass-to-charge ratio.
+•	**Average Rt(min)** — retention time in minutes.
+•	**Adduct type** — adduct assignment string, e.g. [M+H]+, [M+Na]+, [M+NH4]+.
 
-Install everything in one call:
-install.packages(c("dplyr", "tidyr", "readr", "readxl",
-                   "writexl", "xml2", "stringr"))
+Sample-intensity columns are retained unchanged throughout the pipeline and re-merged with identifications at the reporting stage.
+
+**1.3 Software environment**
+- Language	R (≥ 4.2.0)
+- CRAN packages	dplyr, tidyr, readr, readxl, writexl, xml2, stringr
+- External DBs	HMDB (hmdb_metabolites.xml, ~6 GB uncompressed) and IDEOM reference file (DB.xlsx)
+- Contaminant DBs	stanstrup/commonMZ (contaminants_+.tsv, repeating_units_+.tsv) fetched live from GitHub
+- RAM	≥ 8 GB recommended (Part 1 uses a streaming XML parser to keep memory below 1 GB)
+
+**Install everything in one call:
+**install.packages(c("dplyr", "tidyr", "readr", "readxl", "writexl", "xml2", "stringr"))
+
+
 <img width="468" height="621" alt="image" src="https://github.com/user-attachments/assets/ce8d5c18-3ddb-4fd6-9eaa-868765190efb" />
 
 
