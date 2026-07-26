@@ -1,0 +1,982 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║          METABOLOMICS PIPELINE — Meat Quality Study                         ║
+║          VS Code / Terminal version  (run: python metabolomics_pipeline.py) ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Preprocessing : Filter >40% zeros → Half-min imputation → Log2 → Pareto   ║
+║  Analyses      : Volcano · Heatmap · Temporal clusters · Random Forest      ║
+║                  PCA · PLS-DA (+ permutation test) · VIP scores             ║
+║  Outputs       : PNG figures (300 dpi) + single Excel workbook per run      ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Install deps  : pip install pandas numpy matplotlib seaborn scipy          ║
+║                  statsmodels openpyxl adjustText scikit-learn               ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+HOW TO USE
+──────────
+1. Edit the CONFIGURATION section below (file paths + labels).
+2. Run:  python metabolomics_pipeline.py
+3. All outputs land in OUTPUT_DIR (default: pipeline_outputs/).
+"""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION  ←  only section you need to edit
+# ══════════════════════════════════════════════════════════════════════════════
+COMPARISONS = {
+
+    "Exudate_Salmonella": {
+        "metabolite_file": "Data Exudate SA.csv",       # CSV or Excel
+        "metadata_file":   "Metadata ES.csv",   # CSV or Excel
+        "treatment_label": "Salmonella",
+        "control_label":   "Control",
+    },
+
+    "Exudate_Ecoli": {
+        "metabolite_file": "Data Exudate Ecoli.csv",
+        "metadata_file":   "Metadata EED.csv",
+        "treatment_label": "Ecoli",
+        "control_label":   "Control",
+    },
+
+    "Tissue_Salmonella": {
+        "metabolite_file": "Tissue Salmonella.csv",
+        "metadata_file":   "Metadata TSD.csv",
+        "treatment_label": "Salmonella",
+        "control_label":   "Control",
+    },
+
+    "Tissue_Ecoli": {
+        "metabolite_file": "Tissue Ecoli.csv",
+        "metadata_file":   "Metadata TED.csv",
+        "treatment_label": "Ecoli",
+        "control_label":   "Control",
+    },
+}
+
+OUTPUT_DIR      = "pipeline_outputs01"
+ZERO_THRESH     = 0.40    # remove features with >40% zeros
+FC_THRESHOLD    = 0.5     # |log2FC| cutoff  (0.5 ≈ 1.41-fold)
+P_THRESHOLD     = 0.05    # p-value cutoff
+N_TOP_HEATMAP   = 50      # features in heatmap
+N_CLUSTERS      = 4       # k-means clusters for temporal plot
+N_RF_TREES      = 500     # random forest estimators
+N_TOP_RF        = 25      # top features in RF importance chart
+N_VIP_SHOW      = 20      # top features in PLS-DA VIP chart
+N_PERMUTATIONS  = 100     # PLS-DA permutation test iterations
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IMPORTS
+# ══════════════════════════════════════════════════════════════════════════════
+import os, re, warnings, sys
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import seaborn as sns
+from scipy import stats
+from adjustText import adjust_text
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.decomposition import PCA
+from sklearn.cross_decomposition import PLSRegression
+warnings.filterwarnings("ignore")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_file(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"❌  File not found: '{path}'\n   Update the path in COMPARISONS config.")
+    return pd.read_excel(path) if path.endswith((".xlsx", ".xls")) else pd.read_csv(path)
+
+
+def build_sample_dataframe(df_raw, metadata):
+    df_raw = df_raw.loc[:, ~df_raw.columns.str.contains("Unnamed", na=False)]
+    if "Alignment ID" not in df_raw.columns:
+        raise ValueError("'Alignment ID' column not found.")
+    df_feat = df_raw.drop(columns=[c for c in ("Metabolite name",) if c in df_raw.columns],
+                          errors="ignore").set_index("Alignment ID")
+    seen, records = {}, []
+    for col in df_feat.columns:
+        base = re.sub(r"\.\d+$", "", col)
+        if base not in metadata:
+            print(f"  ⚠  '{col}' not in metadata — skipped.")
+            continue
+        treatment, time = metadata[base]
+        rep = seen.get(base, 0); seen[base] = rep + 1
+        records.append({"col": col, "Sample": f"{treatment}_D{time}_R{rep+1}",
+                         "Treatment": treatment, "Time": time})
+    if not records:
+        raise ValueError("No columns matched metadata.")
+    col_map = pd.DataFrame(records).set_index("col")
+    rows = []
+    for _, info in col_map.iterrows():
+        entry = {"Sample": info["Sample"], "Treatment": info["Treatment"], "Time": int(info["Time"])}
+        for fid, val in zip(df_feat.index, df_feat.loc[:, info.name].values):
+            entry[fid] = val
+        rows.append(entry)
+    df = pd.DataFrame(rows)
+    df["Treatment"] = pd.Categorical(df["Treatment"])
+    df["Time"]      = pd.Categorical(df["Time"])
+    feat_cols = [c for c in df.columns if c not in ("Sample", "Treatment", "Time")]
+    return df, feat_cols
+
+
+def cohens_d(a, b):
+    pooled = np.sqrt((np.std(a, ddof=1)**2 + np.std(b, ddof=1)**2) / 2)
+    return (np.mean(a) - np.mean(b)) / pooled if pooled > 0 else np.nan
+
+
+def clean_label(name, max_len=28):
+    name = re.sub(r"^[A-Z]+\d+[-\d]*!", "", name).strip()
+    name = re.sub(r"\s*\[IIN[^\]]*\]", "", name).strip()
+    name = re.sub(r"^w/o MS2:\s*", "", name).strip()
+    name = name.rstrip("![( ").strip()
+    if len(name) > max_len:
+        cut = name[:max_len]; sp = cut.rfind(" ")
+        return (cut[:sp] if sp > max_len * 0.6 else cut) + "…"
+    return name
+
+
+def preprocess(df, feat_cols, name, out_prefix):
+    n = len(df)
+    raw_vals = df[feat_cols].values.flatten().astype(float)
+
+    # 1. Filter >40% zeros
+    kept, removed = [], []
+    for feat in feat_cols:
+        (kept if (df[feat] == 0).sum() / n <= ZERO_THRESH else removed).append(feat)
+    print(f"  Features raw            : {len(feat_cols)}")
+    print(f"  Removed (>40% zeros)    : {len(removed)}")
+    print(f"  Kept features           : {len(kept)}")
+
+    df_p = df[["Sample", "Treatment", "Time"] + kept].copy()
+
+    # 2. Half-minimum imputation
+    n_imp = 0
+    for feat in kept:
+        col = df_p[feat].astype(float); nz = col[col > 0]
+        if len(nz) > 0 and (col == 0).any():
+            df_p[feat] = col.replace(0, nz.min() / 2)
+            n_imp += int((col == 0).sum())
+    print(f"  Zeros imputed (½-min)   : {n_imp}")
+
+    # 3. Log2 transform
+    for feat in kept:
+        df_p[feat] = np.log2(df_p[feat].astype(float))
+    log2_vals = df_p[kept].values.flatten()
+
+    # 4. Pareto scaling
+    for feat in kept:
+        sd = df_p[feat].std()
+        if sd > 0: df_p[feat] = df_p[feat] / np.sqrt(sd)
+    proc_vals = df_p[kept].values.flatten()
+    print(f"  After Log2+Pareto skew  : {pd.Series(proc_vals).skew():.3f}")
+
+    # QC figure
+    raw_pos = raw_vals[(raw_vals > 0) & ~np.isnan(raw_vals)]
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig.suptitle(f"{name.replace('_', ' ')} — Data Preprocessing QC", fontsize=14, fontweight="bold")
+    for ax, vals, title, col, xlabel in zip(
+        axes,
+        [raw_pos, log2_vals[~np.isnan(log2_vals)], proc_vals[~np.isnan(proc_vals)]],
+        ["A) Raw Intensities", "B) After Log₂ Transform", "C) After Log₂ + Pareto Scaling"],
+        ["#E74C3C", "#F39C12", "#27AE60"],
+        ["Peak Intensity", "log₂(Intensity)", "Scaled Intensity"]
+    ):
+        ax.hist(vals, bins="fd", color=col, alpha=0.78, edgecolor="none")
+        ax.set_title(title, fontweight="bold"); ax.set_xlabel(xlabel); ax.set_ylabel("Frequency")
+        ax.text(0.97, 0.95, f"Skewness = {pd.Series(vals).skew():.2f}",
+                transform=ax.transAxes, ha="right", va="top", fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#ccc"))
+        ax.grid(True, alpha=0.3)
+    summary = (f"  Features raw: {len(feat_cols)}   Removed (>40% zeros): {len(removed)}   "
+               f"Kept: {len(kept)}   Zeros imputed: {n_imp}\n"
+               f"  Imputation: half-minimum   Transform: Log₂   Scaling: Pareto (÷√SD)")
+    fig.text(0.5, -0.03, summary, ha="center", fontsize=9, fontfamily="monospace",
+             bbox=dict(boxstyle="round,pad=0.5", fc="#F8F9FA", ec="#AEB6BF", alpha=0.9))
+    plt.tight_layout()
+    plt.savefig(f"{out_prefix}_preprocessing_QC.png", dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close()
+    print(f"  ✓ QC figure saved")
+
+    return df_p, kept, {
+        "features_raw": len(feat_cols), "features_removed": len(removed),
+        "features_kept": len(kept), "zeros_imputed": n_imp,
+        "raw_skewness": round(float(pd.Series(raw_pos).skew()), 3),
+        "post_skewness": round(float(pd.Series(proc_vals).skew()), 3),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VOLCANO PLOTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_volcano_df(df, feat_cols, name_map, treat_lbl, ctrl_lbl, tp):
+    tp_df = df[df["Time"] == tp]; rows = []
+    for feat in feat_cols:
+        t_v = tp_df[tp_df["Treatment"] == treat_lbl][feat].dropna().values
+        c_v = tp_df[tp_df["Treatment"] == ctrl_lbl][feat].dropna().values
+        if len(t_v) > 1 and len(c_v) > 1:
+            _, p = stats.ttest_ind(t_v, c_v)
+            log2fc = np.mean(t_v) - np.mean(c_v)
+            if not np.isnan(p) and not np.isnan(log2fc):
+                raw = name_map.get(feat, "Unknown")
+                clean = re.sub(r"^w/o MS2:", "", str(raw)).strip()
+                rows.append({"Feature": feat, "Name": clean, "log2FC": log2fc,
+                             "pval": p, "neglog10p": -np.log10(p)})
+    vdf = pd.DataFrame(rows)
+    def classify(r):
+        if r["pval"] < P_THRESHOLD and r["log2FC"] >  FC_THRESHOLD: return "up"
+        if r["pval"] < P_THRESHOLD and r["log2FC"] < -FC_THRESHOLD: return "down"
+        if r["pval"] < P_THRESHOLD:                                  return "sig_only"
+        return "ns"
+    vdf["class"] = vdf.apply(classify, axis=1)
+    return vdf
+
+
+def make_publication_volcano(df, feat_cols, name_map, treat_lbl, ctrl_lbl,
+                              tp, comparison_title, out_path):
+    vdf   = make_volcano_df(df, feat_cols, name_map, treat_lbl, ctrl_lbl, tp)
+    n_up  = (vdf["class"] == "up").sum()
+    n_dn  = (vdf["class"] == "down").sum()
+    n_sig = (vdf["class"] == "sig_only").sum()
+
+    color_map = {"up": "#C0392B", "down": "#2471A3", "sig_only": "#E67E22", "ns": "#95A5A6"}
+    size_map  = {"up": 70, "down": 70, "sig_only": 45, "ns": 18}
+    alpha_map = {"up": 0.92, "down": 0.92, "sig_only": 0.80, "ns": 0.45}
+
+    fig, ax = plt.subplots(figsize=(11, 9))
+    fig.patch.set_facecolor("white"); ax.set_facecolor("white")
+    for cls in ["ns", "sig_only", "down", "up"]:
+        mask = vdf["class"] == cls
+        ax.scatter(vdf.loc[mask, "log2FC"], vdf.loc[mask, "neglog10p"],
+                   c=color_map[cls], s=size_map[cls], alpha=alpha_map[cls],
+                   edgecolors="none" if cls == "ns" else "white", linewidths=0.4,
+                   zorder=2 if cls == "ns" else 3)
+
+    p_line = -np.log10(P_THRESHOLD)
+    ax.axhline(p_line,        color="#7F8C8D", linestyle="--", linewidth=1.2, alpha=0.8, zorder=1)
+    ax.axvline( FC_THRESHOLD, color="#7F8C8D", linestyle="--", linewidth=1.2, alpha=0.8, zorder=1)
+    ax.axvline(-FC_THRESHOLD, color="#7F8C8D", linestyle="--", linewidth=1.2, alpha=0.8, zorder=1)
+
+    # Labels: top 6 up + top 4 down, scored by significance × FC
+    lab_up = (vdf[(vdf["class"] == "up") & (vdf["Name"] != "Unknown")].copy()
+              .assign(score=lambda d: d["neglog10p"] * 1.5 + d["log2FC"].abs())
+              .assign(CleanName=lambda d: d["Name"].apply(clean_label))
+              .nlargest(6, "score"))
+    lab_dn = (vdf[(vdf["class"] == "down") & (vdf["Name"] != "Unknown")].copy()
+              .assign(score=lambda d: d["neglog10p"] * 1.5 + d["log2FC"].abs())
+              .assign(CleanName=lambda d: d["Name"].apply(clean_label))
+              .nlargest(4, "score"))
+    lab = pd.concat([lab_up, lab_dn], ignore_index=True)
+
+    texts = []
+    for _, row in lab.iterrows():
+        t = ax.text(row["log2FC"], row["neglog10p"], row["CleanName"],
+                    fontsize=8, color="#1C2833", fontstyle="italic", fontweight="semibold",
+                    zorder=5, bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
+                                        edgecolor=color_map[row["class"]],
+                                        linewidth=1.0, alpha=0.95))
+        texts.append(t)
+    if texts:
+        adjust_text(texts, ax=ax,
+                    arrowprops=dict(arrowstyle="-", color="#7F8C8D", lw=0.9),
+                    expand_points=(2.5, 2.5), expand_text=(2.2, 2.2),
+                    force_points=(1.8, 1.5), force_text=(1.5, 1.2),
+                    lim=800, only_move={"points": "y", "text": "xy"})
+
+    # Legend at lower-left — away from labelled metabolites which cluster at top corners
+    ax.legend(handles=[
+        mpatches.Patch(facecolor=color_map["up"],       label=f"Upregulated (n={n_up})"),
+        mpatches.Patch(facecolor=color_map["down"],     label=f"Downregulated (n={n_dn})"),
+        mpatches.Patch(facecolor=color_map["sig_only"], label=f"Sig. (|log₂FC|<{FC_THRESHOLD}) (n={n_sig})"),
+        mpatches.Patch(facecolor=color_map["ns"],       label="Not significant"),
+    ], loc="upper right", frameon=True, framealpha=0.97, fontsize=9,
+       edgecolor="#BDC3C7", bbox_to_anchor=(-0.03, 1.04),
+       handlelength=1.2, handleheight=1.0, borderpad=0.8)
+
+    yb = ax.get_ylim()[0]; xl = ax.get_xlim()[0]
+    ax.text( FC_THRESHOLD + 0.05, yb + 0.05, f"FC=+{FC_THRESHOLD}", fontsize=8, color="#7F8C8D", va="bottom")
+    ax.text(-FC_THRESHOLD - 0.05, yb + 0.05, f"FC=−{FC_THRESHOLD}", fontsize=8, color="#7F8C8D", va="bottom", ha="right")
+    ax.text(xl + 0.05, p_line + 0.08, f"p={P_THRESHOLD}", fontsize=8, color="#7F8C8D")
+    ax.set_xlabel("log₂(Fold Change)", fontsize=12, labelpad=8)
+    ax.set_ylabel("−log₁₀(p-value)", fontsize=12, labelpad=8)
+    ax.set_title(f"{comparison_title} - Day {tp}", fontsize=13, fontweight="bold", pad=14, loc="center", x=0.5)
+    for spine in ["top", "right"]: ax.spines[spine].set_visible(False)
+    ax.spines["left"].set_linewidth(0.8); ax.spines["bottom"].set_linewidth(0.8)
+    ax.tick_params(labelsize=10); ax.grid(False)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight", facecolor="white"); plt.close()
+    print(f"  ✓ Volcano Day {tp}: ↑{n_up} up | ↓{n_dn} down | {n_sig} sig (low FC)")
+    return vdf
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADVANCED ANALYSES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_heatmap(df_proc, feat_cols, top_hm, name_map, time_points,
+                treat_lbl, ctrl_lbl, out_path):
+    groups = []
+    for tp in time_points:
+        for tr in [ctrl_lbl, treat_lbl]:
+            mask = (df_proc["Treatment"] == tr) & (df_proc["Time"] == tp)
+            groups.append((f"{tr}-{tp}", df_proc.loc[mask, top_hm].mean()))
+    group_labels = [g[0] for g in groups]
+    hm_raw  = pd.DataFrame({g[0]: g[1] for g in groups}, index=top_hm)
+    hm_norm = hm_raw.apply(lambda r: (r - r.min()) / (r.max() - r.min() + 1e-9), axis=1)
+    row_labels = []
+    for feat in top_hm:
+        raw = name_map.get(feat, "Unknown")
+        clean = re.sub(r"^w/o MS2:", "", str(raw)).strip()
+        row_labels.append(clean_label(clean, 24) if clean != "Unknown" else f"Feature {feat}")
+    col_colors = ["#3498DB" if ctrl_lbl in c else "#E74C3C" for c in group_labels]
+    g = sns.clustermap(hm_norm, row_cluster=True, col_cluster=False, cmap="viridis",
+                       yticklabels=row_labels, xticklabels=group_labels, figsize=(13, 18),
+                       col_colors=[col_colors], linewidths=0,
+                       cbar_kws={"label": "Normalised Intensity", "shrink": 0.4},
+                       dendrogram_ratio=(0.15, 0.0), colors_ratio=0.02)
+    g.ax_heatmap.set_xlabel("Treatment — Time (days)", fontsize=12, labelpad=10)
+    g.ax_heatmap.set_ylabel("Feature (Peak)", fontsize=12, labelpad=10)
+    g.ax_heatmap.set_title(f"Top {N_TOP_HEATMAP} Features — Temporal Patterns (Normalised)",
+                           fontsize=13, fontweight="bold", pad=12)
+    g.ax_heatmap.tick_params(axis="y", labelsize=8)
+    g.ax_heatmap.tick_params(axis="x", labelsize=9, rotation=30)
+    g.ax_heatmap.legend(handles=[mpatches.Patch(color="#3498DB", label=ctrl_lbl),
+                                  mpatches.Patch(color="#E74C3C", label=treat_lbl)],
+                        loc="upper right", bbox_to_anchor=(1.18, 1.05),
+                        fontsize=9, frameon=True, title="Treatment")
+    plt.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white"); plt.close()
+    print(f"  ✓ Heatmap saved")
+
+
+def run_temporal_clusters(df_proc, feat_cols, time_points, treat_lbl, ctrl_lbl, out_path):
+    traj_data = []
+    for tp in time_points:
+        for tr in [ctrl_lbl, treat_lbl]:
+            mask = (df_proc["Treatment"] == tr) & (df_proc["Time"] == tp)
+            traj_data.append(df_proc.loc[mask, feat_cols].mean())
+    traj_matrix = pd.DataFrame(traj_data).T
+    traj_matrix.index = feat_cols
+    ctrl_d1 = df_proc[(df_proc["Treatment"] == ctrl_lbl) &
+                       (df_proc["Time"] == time_points[0])][feat_cols].mean()
+    traj_norm = traj_matrix.divide(ctrl_d1, axis=0) * 100
+    traj_norm = traj_norm.replace([np.inf, -np.inf], np.nan).dropna()
+    scaler = StandardScaler()
+    clusters = KMeans(n_clusters=N_CLUSTERS, random_state=42, n_init=10).fit_predict(
+        scaler.fit_transform(traj_norm))
+    traj_norm["Cluster"] = clusters
+    n_tp = len(time_points)
+    ctrl_idx  = list(range(0, n_tp * 2, 2))
+    treat_idx = list(range(1, n_tp * 2, 2))
+    x_days = [int(tp) for tp in time_points]
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10), sharey=False)
+    fig.patch.set_facecolor("white")
+    fig.suptitle("Feature Clusters Over Time", fontsize=15, fontweight="bold", y=1.01)
+    for ax, cid in zip(axes.flat, sorted(traj_norm["Cluster"].unique())):
+        cdata  = traj_norm[traj_norm["Cluster"] == cid].drop(columns="Cluster")
+        c_vals = cdata.iloc[:, ctrl_idx]
+        t_vals = cdata.iloc[:, treat_idx]
+        for _, row in c_vals.iterrows(): ax.plot(x_days, row.values, color="#3498DB", alpha=0.09, linewidth=0.7)
+        for _, row in t_vals.iterrows(): ax.plot(x_days, row.values, color="#E74C3C", alpha=0.09, linewidth=0.7)
+        ax.plot(x_days, c_vals.mean().values, color="#2980B9", linewidth=2.5, label=ctrl_lbl,  zorder=5)
+        ax.plot(x_days, t_vals.mean().values, color="#C0392B", linewidth=2.5, label=treat_lbl, zorder=5)
+        ax.set_title(f"Cluster {cid+1}  (n={len(cdata)} features)", fontsize=11, fontweight="bold")
+        ax.set_xlabel("Time (days)", fontsize=10)
+        ax.set_ylabel("Intensity (% of control at t=0)", fontsize=9)
+        ax.set_xticks(x_days)
+        all_v = np.concatenate([c_vals.values.flatten(), t_vals.values.flatten()])
+        ax.set_ylim(max(0, np.nanpercentile(all_v, 1) * 0.85), np.nanpercentile(all_v, 99) * 1.15)
+        ax.axhline(100, color="grey", linestyle="--", linewidth=0.8, alpha=0.5)
+        ax.legend(fontsize=9, loc="upper left"); ax.grid(True, alpha=0.2)
+        ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white"); plt.close()
+    print(f"  ✓ Temporal clusters saved")
+
+
+def run_random_forest(df_proc, rf_feats, name_map, treat_lbl, ctrl_lbl, out_prefix):
+    X = df_proc[rf_feats].values
+    y = LabelEncoder().fit_transform(df_proc["Treatment"].astype(str).values)
+    rf = RandomForestClassifier(n_estimators=N_RF_TREES, random_state=42,
+                                n_jobs=-1, max_features="sqrt", class_weight="balanced")
+    cv_scores = cross_val_score(rf, X, y, cv=StratifiedKFold(5, shuffle=True, random_state=42),
+                                scoring="roc_auc")
+    rf.fit(X, y)
+    importances = pd.Series(rf.feature_importances_, index=rf_feats)
+    top_imp = importances.nlargest(N_TOP_RF)
+    top_names = [clean_label(re.sub(r"^w/o MS2:", "", str(name_map.get(f, "Unknown"))).strip(), 26)
+                 if name_map.get(f, "Unknown") != "Unknown" else f"Feature {f}"
+                 for f in top_imp.index]
+    imp_mean = top_imp.mean()
+    bar_colors = ["#C0392B" if v >= imp_mean*1.5 else "#E67E22" if v >= imp_mean else "#BDC3C7"
+                  for v in top_imp.values]
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    fig.patch.set_facecolor("white")
+    fig.suptitle(f"Random Forest — Treatment Classification ({treat_lbl} vs {ctrl_lbl})",
+                 fontsize=14, fontweight="bold")
+    ax_i = axes[0]
+    ax_i.barh(range(len(top_imp)), top_imp.values[::-1], color=bar_colors[::-1],
+              edgecolor="white", height=0.7)
+    ax_i.set_yticks(range(len(top_imp))); ax_i.set_yticklabels(top_names[::-1], fontsize=8.5, fontstyle="italic")
+    ax_i.set_xlabel("Mean Decrease in Impurity", fontsize=10)
+    ax_i.set_title(f"A) Top {N_TOP_RF} Most Important Features\n(n={len(rf_feats)} features used)",
+                   fontsize=11, fontweight="bold")
+    ax_i.axvline(imp_mean, color="grey", linestyle="--", linewidth=1, alpha=0.7, label=f"Mean = {imp_mean:.4f}")
+    ax_i.legend(fontsize=8); ax_i.grid(True, alpha=0.25, axis="x")
+    ax_i.spines["top"].set_visible(False); ax_i.spines["right"].set_visible(False)
+    ax_c = axes[1]
+    fold_colors = ["#27AE60" if s >= 0.7 else "#E67E22" if s >= 0.5 else "#E74C3C" for s in cv_scores]
+    bars2 = ax_c.bar([f"Fold {i+1}" for i in range(len(cv_scores))],
+                     cv_scores, color=fold_colors, edgecolor="white", width=0.5)
+    ax_c.axhline(cv_scores.mean(), color="#2980B9", linestyle="--", linewidth=2)
+    ax_c.axhline(0.5, color="grey", linestyle=":", linewidth=1, alpha=0.6)
+    ax_c.set_ylim(0, 1.05); ax_c.set_ylabel("ROC-AUC Score", fontsize=11)
+    ax_c.set_title(f"B) 5-Fold Cross-Validation\n({treat_lbl} vs {ctrl_lbl})", fontsize=11, fontweight="bold")
+    ax_c.grid(True, alpha=0.25, axis="y")
+    ax_c.spines["top"].set_visible(False); ax_c.spines["right"].set_visible(False)
+    for bar, score in zip(bars2, cv_scores):
+        ax_c.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.01, f"{score:.3f}",
+                  ha="center", va="bottom", fontsize=9, fontweight="bold")
+    ax_c.legend(handles=[
+        plt.Line2D([0],[0], color="#2980B9", linestyle="--", linewidth=2,
+                   label=f"Mean AUC = {cv_scores.mean():.3f} ± {cv_scores.std():.3f}"),
+        plt.Line2D([0],[0], color="grey", linestyle=":", linewidth=1, label="Random (0.5)"),
+    ], loc="lower left", fontsize=8.5, frameon=True, framealpha=0.85, edgecolor="#AEB6BF")
+    plt.tight_layout()
+    plt.savefig(f"{out_prefix}_random_forest.png", dpi=200, bbox_inches="tight", facecolor="white"); plt.close()
+    print(f"  ✓ Random forest saved | Mean AUC: {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
+    return pd.DataFrame({"Alignment_ID": top_imp.index, "Metabolite_Name": top_names,
+                         "Importance": top_imp.values, "Rank": range(1, len(top_imp)+1)})
+
+
+def compute_vip(pls_model, X):
+    t = pls_model.x_scores_; w = pls_model.x_weights_; q = pls_model.y_loadings_
+    p, h = w.shape; vips = np.zeros(p)
+    s = np.diag(t.T @ t @ q.T @ q); total_s = np.sum(s)
+    for i in range(p):
+        weight = np.array([(w[i,j] / np.linalg.norm(w[:,j]))**2 * s[j] for j in range(h)])
+        vips[i] = np.sqrt(p * np.sum(weight) / total_s)
+    return vips
+
+
+def run_pca_plsda(df_proc, feat_cols, name_map, time_points, treat_lbl, ctrl_lbl, out_prefix, comp_name):
+    day_palette  = {1: "#3498DB", 7: "#27AE60", 14: "#E67E22", 21: "#C0392B"}
+    treat_marker = {treat_lbl: "^", ctrl_lbl: "o"}
+    X_all = df_proc[feat_cols].values
+    X_sc  = StandardScaler().fit_transform(X_all)
+    days_arr  = df_proc["Time"].astype(int).values
+    treat_arr = df_proc["Treatment"].astype(str).values
+    y_bin     = LabelEncoder().fit_transform(treat_arr)
+
+    # ── PCA ───────────────────────────────────────────────────────────────────
+    pca   = PCA(n_components=min(10, X_sc.shape[1], X_sc.shape[0]))
+    X_pca = pca.fit_transform(X_sc)
+    var_ex = pca.explained_variance_ratio_ * 100
+    fig_pca, ax_pca = plt.subplots(1, 2, figsize=(16, 7))
+    fig_pca.patch.set_facecolor("white")
+    fig_pca.suptitle(f"{comp_name.replace('_',' ')} — PCA\nUnsupervised variance structure",
+                     fontsize=14, fontweight="bold")
+    for day in sorted(set(days_arr)):
+        col = day_palette.get(day, "#888888")
+        for tr in [ctrl_lbl, treat_lbl]:
+            mask = (days_arr == day) & (treat_arr == tr)
+            ax_pca[0].scatter(X_pca[mask, 0], X_pca[mask, 1], c=col,
+                              marker=treat_marker[tr], s=90, edgecolors="white",
+                              linewidths=0.6, alpha=0.9)
+    ax_pca[0].set_xlabel(f"PC1 ({var_ex[0]:.1f}% variance)", fontsize=11)
+    ax_pca[0].set_ylabel(f"PC2 ({var_ex[1]:.1f}% variance)", fontsize=11)
+    ax_pca[0].set_title("A) PC1 vs PC2 — coloured by Day, shaped by Treatment", fontsize=11, fontweight="bold")
+    ax_pca[0].axhline(0, color="grey", lw=0.5, ls="--", alpha=0.4)
+    ax_pca[0].axvline(0, color="grey", lw=0.5, ls="--", alpha=0.4)
+    ax_pca[0].grid(True, alpha=0.15)
+    ax_pca[0].spines["top"].set_visible(False); ax_pca[0].spines["right"].set_visible(False)
+    ax_pca[0].legend(handles=[mpatches.Patch(color=day_palette.get(d,"#888"), label=f"Day {d}")
+                               for d in sorted(set(days_arr))] +
+                              [plt.Line2D([0],[0], marker="o", color="grey", linestyle="None",
+                                         markersize=8, label=ctrl_lbl),
+                               plt.Line2D([0],[0], marker="^", color="grey", linestyle="None",
+                                         markersize=8, label=treat_lbl)],
+                     loc="best", fontsize=8.5, framealpha=0.85, ncol=2, edgecolor="#AEB6BF")
+    n_show = min(10, len(var_ex))
+    bars_sc = ax_pca[1].bar(range(1, n_show+1), var_ex[:n_show], color="#3498DB", edgecolor="white", alpha=0.85)
+    ax2b = ax_pca[1].twinx()
+    ax2b.plot(range(1, n_show+1), np.cumsum(var_ex[:n_show]), "o--", color="#C0392B", linewidth=2, markersize=6)
+    ax2b.axhline(80, color="#C0392B", linestyle=":", alpha=0.5, linewidth=1)
+    ax2b.set_ylabel("Cumulative Explained Variance (%)", fontsize=10, color="#C0392B")
+    ax2b.tick_params(axis="y", labelcolor="#C0392B"); ax2b.set_ylim(0, 105)
+    ax_pca[1].set_xlabel("Principal Component", fontsize=11)
+    ax_pca[1].set_ylabel("Explained Variance (%)", fontsize=11)
+    ax_pca[1].set_title("B) Scree Plot", fontsize=11, fontweight="bold")
+    ax_pca[1].grid(True, alpha=0.2, axis="y"); ax_pca[1].spines["top"].set_visible(False)
+    for bar, v in zip(bars_sc, var_ex[:n_show]):
+        ax_pca[1].text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.3,
+                       f"{v:.1f}%", ha="center", va="bottom", fontsize=8)
+    plt.tight_layout()
+    plt.savefig(f"{out_prefix}_PCA.png", dpi=200, bbox_inches="tight", facecolor="white"); plt.close()
+    print(f"  ✓ PCA saved | PC1={var_ex[0]:.1f}%  PC2={var_ex[1]:.1f}%")
+
+    # ── PCA per day ────────────────────────────────────────────────────────────
+    fig_tpca, axes_tpca = plt.subplots(2, 2, figsize=(14, 11))
+    fig_tpca.patch.set_facecolor("white")
+    fig_tpca.suptitle(f"{comp_name.replace('_',' ')} — PCA per Aging Day\n"
+                      f"Metabolic shift: {treat_lbl} vs {ctrl_lbl}",
+                      fontsize=13, fontweight="bold")
+    for ax_t, tp in zip(axes_tpca.flat, sorted(set(days_arr))):
+        tp_mask = days_arr == tp
+        if tp_mask.sum() < 3:
+            ax_t.set_title(f"Day {tp} — insufficient samples", fontsize=10); ax_t.axis("off"); continue
+        X_tp = X_sc[tp_mask]; y_tp = treat_arr[tp_mask]
+        pca_t = PCA(n_components=min(2, X_tp.shape[1], X_tp.shape[0]))
+        try: Xt = pca_t.fit_transform(X_tp)
+        except Exception:
+            ax_t.set_title(f"Day {tp} — PCA failed", fontsize=10); ax_t.axis("off"); continue
+        ve1 = pca_t.explained_variance_ratio_[0]*100
+        ve2 = pca_t.explained_variance_ratio_[1]*100 if Xt.shape[1]>1 else 0
+        col_t = day_palette.get(tp, "#888888")
+        for tr in [ctrl_lbl, treat_lbl]:
+            m = y_tp == tr
+            ax_t.scatter(Xt[m,0], Xt[m,1] if Xt.shape[1]>1 else np.zeros(m.sum()),
+                         c=col_t, marker=treat_marker[tr], s=100,
+                         edgecolors="white", linewidths=0.6, alpha=0.9, label=tr)
+        ax_t.set_xlabel(f"PC1 ({ve1:.1f}%)", fontsize=10); ax_t.set_ylabel(f"PC2 ({ve2:.1f}%)", fontsize=10)
+        ax_t.set_title(f"Day {tp}", fontsize=11, fontweight="bold", color=col_t)
+        ax_t.axhline(0, color="grey", lw=0.5, ls="--", alpha=0.4)
+        ax_t.axvline(0, color="grey", lw=0.5, ls="--", alpha=0.4)
+        ax_t.legend(fontsize=8.5, loc="best", framealpha=0.85, edgecolor="#AEB6BF")
+        ax_t.grid(True, alpha=0.15)
+        ax_t.spines["top"].set_visible(False); ax_t.spines["right"].set_visible(False)
+    plt.tight_layout()
+    plt.savefig(f"{out_prefix}_PCA_per_day.png", dpi=200, bbox_inches="tight", facecolor="white"); plt.close()
+    print(f"  ✓ PCA per day saved")
+
+    # ── PLS-DA + permutation test ──────────────────────────────────────────────
+    pls = PLSRegression(n_components=2, scale=True, max_iter=500)
+    pls.fit(X_sc, y_bin)
+    X_pls = pls.transform(X_sc)
+    if isinstance(X_pls, tuple): X_pls = X_pls[0]
+    X_pls = np.array(X_pls)
+    if X_pls.ndim == 1: X_pls = X_pls.reshape(-1, 1)
+
+    # VIP scores
+    vip_scores = compute_vip(pls, X_sc)
+    vip_series = pd.Series(vip_scores, index=feat_cols)
+    top_vip    = vip_series.nlargest(N_VIP_SHOW)
+    top_vip_names = [clean_label(re.sub(r"^w/o MS2:", "", str(name_map.get(f,"Unknown"))).strip(), 26)
+                     if name_map.get(f,"Unknown") != "Unknown" else f"Feature {f}"
+                     for f in top_vip.index]
+    n_vip_gt1 = (vip_scores >= 1.0).sum()
+    print(f"  VIP ≥ 1.0: {n_vip_gt1} / {len(feat_cols)}")
+
+    # ── Permutation test: Q² (R² on held-out data via CV) ─────────────────────
+    print(f"  Running {N_PERMUTATIONS} permutations for PLS-DA validation...")
+    def pls_cv_r2(X, y):
+        cv  = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        r2s = []
+        for train, test in cv.split(X, y):
+            m = PLSRegression(n_components=2, scale=True, max_iter=500)
+            m.fit(X[train], y[train])
+            pred = m.predict(X[test]).flatten()
+            ss_res = np.sum((y[test] - pred)**2)
+            ss_tot = np.sum((y[test] - np.mean(y[test]))**2)
+            r2s.append(1 - ss_res / ss_tot if ss_tot > 0 else 0)
+        return np.mean(r2s)
+
+    observed_q2 = pls_cv_r2(X_sc, y_bin)
+    perm_q2s = []
+    rng = np.random.default_rng(42)
+    for _ in range(N_PERMUTATIONS):
+        perm_q2s.append(pls_cv_r2(X_sc, rng.permutation(y_bin)))
+    perm_q2s = np.array(perm_q2s)
+    p_perm   = (np.sum(perm_q2s >= observed_q2) + 1) / (N_PERMUTATIONS + 1)
+    print(f"  PLS-DA Q²={observed_q2:.3f}  permutation p={p_perm:.3f}")
+
+    # ── PLS-DA figure: 3 panels ────────────────────────────────────────────────
+    fig_pls = plt.figure(figsize=(20, 7))
+    fig_pls.patch.set_facecolor("white")
+    fig_pls.suptitle(f"{comp_name.replace('_',' ')} — PLS-DA  |  "
+                     f"Supervised: {treat_lbl} vs {ctrl_lbl}",
+                     fontsize=14, fontweight="bold")
+
+    ax_score = fig_pls.add_subplot(1, 3, 1)
+    for day in sorted(set(days_arr)):
+        col = day_palette.get(day, "#888888")
+        for tr in [ctrl_lbl, treat_lbl]:
+            mask = (days_arr == day) & (treat_arr == tr)
+            ax_score.scatter(X_pls[mask,0],
+                             X_pls[mask,1] if X_pls.shape[1]>1 else np.zeros(mask.sum()),
+                             c=col, marker=treat_marker[tr], s=100,
+                             edgecolors="white", linewidths=0.6, alpha=0.9)
+    ax_score.set_xlabel("LV1", fontsize=11); ax_score.set_ylabel("LV2", fontsize=11)
+    ax_score.set_title("A) Score Plot\n(coloured by Day, shaped by Treatment)",
+                       fontsize=11, fontweight="bold")
+    ax_score.axhline(0, color="grey", lw=0.5, ls="--", alpha=0.4)
+    ax_score.axvline(0, color="grey", lw=0.5, ls="--", alpha=0.4)
+    ax_score.grid(True, alpha=0.15)
+    ax_score.spines["top"].set_visible(False); ax_score.spines["right"].set_visible(False)
+    ax_score.legend(handles=[mpatches.Patch(color=day_palette.get(d,"#888"), label=f"Day {d}")
+                              for d in sorted(set(days_arr))] +
+                             [plt.Line2D([0],[0], marker="o", color="grey", linestyle="None",
+                                        markersize=8, label=ctrl_lbl),
+                              plt.Line2D([0],[0], marker="^", color="grey", linestyle="None",
+                                        markersize=8, label=treat_lbl)],
+                    loc="best", fontsize=8, framealpha=0.85, ncol=2, edgecolor="#AEB6BF")
+
+    ax_vip = fig_pls.add_subplot(1, 3, 2)
+    vip_colors = ["#C0392B" if v >= 1.5 else "#E67E22" if v >= 1.0 else "#BDC3C7"
+                  for v in top_vip.values]
+    ax_vip.barh(range(len(top_vip)), top_vip.values[::-1],
+                color=vip_colors[::-1], edgecolor="white", height=0.7)
+    ax_vip.set_yticks(range(len(top_vip)))
+    ax_vip.set_yticklabels(top_vip_names[::-1], fontsize=8.5, fontstyle="italic")
+    ax_vip.axvline(1.0, color="#C0392B", linestyle="--", linewidth=1.2, alpha=0.8)
+    ax_vip.set_xlabel("VIP Score", fontsize=10)
+    ax_vip.set_title(f"B) Top {N_VIP_SHOW} VIP Scores\n(≥1.0 discriminating; {n_vip_gt1} total)",
+                     fontsize=11, fontweight="bold")
+    ax_vip.legend(handles=[mpatches.Patch(color="#C0392B", label="VIP ≥ 1.5"),
+                            mpatches.Patch(color="#E67E22", label="VIP 1.0–1.5"),
+                            mpatches.Patch(color="#BDC3C7", label="VIP < 1.0"),
+                            plt.Line2D([0],[0], color="#C0392B", linestyle="--", lw=1.2, label="VIP=1.0")],
+                  loc="lower right", fontsize=8, framealpha=0.9)
+    ax_vip.grid(True, alpha=0.2, axis="x")
+    ax_vip.spines["top"].set_visible(False); ax_vip.spines["right"].set_visible(False)
+
+    # Panel C: permutation test
+    ax_perm = fig_pls.add_subplot(1, 3, 3)
+    ax_perm.hist(perm_q2s, bins=20, color="#BDC3C7", edgecolor="white",
+                 alpha=0.85, label=f"Permuted Q² (n={N_PERMUTATIONS})")
+    ax_perm.axvline(observed_q2, color="#C0392B", linewidth=2.5,
+                    label=f"Observed Q² = {observed_q2:.3f}")
+    ax_perm.set_xlabel("Q² (5-fold CV)", fontsize=11)
+    ax_perm.set_ylabel("Count", fontsize=11)
+    star = "***" if p_perm < 0.001 else "**" if p_perm < 0.01 else "*" if p_perm < 0.05 else "ns"
+    ax_perm.set_title(f"C) Permutation Test (n={N_PERMUTATIONS})\n"
+                      f"p = {p_perm:.3f}  {star}", fontsize=11, fontweight="bold")
+    ax_perm.legend(fontsize=9, framealpha=0.85)
+    ax_perm.grid(True, alpha=0.2)
+    ax_perm.spines["top"].set_visible(False); ax_perm.spines["right"].set_visible(False)
+
+    plt.tight_layout()
+    plt.savefig(f"{out_prefix}_PLSDA.png", dpi=200, bbox_inches="tight", facecolor="white"); plt.close()
+    print(f"  ✓ PLS-DA saved")
+
+    return pd.DataFrame({"Alignment_ID": top_vip.index, "Metabolite_Name": top_vip_names,
+                         "VIP_Score": top_vip.values, "Rank": range(1, len(top_vip)+1),
+                         "Discriminating": ["Yes" if v >= 1.0 else "No" for v in top_vip.values]})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CORE STATISTICS & SUMMARY FIGURES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_statistics_figures(df_proc, feat_cols, time_points, treat_lbl, ctrl_lbl, out_prefix, comp_name):
+    treat_sig = time_sig = interaction_sig = 0
+    all_pvals, effect_data = [], []
+    for feat in feat_cols:
+        t_v = df_proc[df_proc["Treatment"]==treat_lbl][feat].dropna().values
+        c_v = df_proc[df_proc["Treatment"]==ctrl_lbl][feat].dropna().values
+        if len(t_v)>1 and len(c_v)>1:
+            _, p = stats.ttest_ind(t_v, c_v)
+            if not np.isnan(p):
+                all_pvals.append(p)
+                if p < 0.05: treat_sig += 1
+        if len(time_points) >= 2:
+            fst = df_proc[df_proc["Time"]==time_points[0]][feat].dropna().values
+            lst = df_proc[df_proc["Time"]==time_points[-1]][feat].dropna().values
+            if len(fst)>1 and len(lst)>1:
+                _, pt = stats.ttest_ind(fst, lst)
+                if not np.isnan(pt):
+                    if pt < 0.05: time_sig += 1
+                    if p < 0.1 and pt < 0.1: interaction_sig += 1
+    for tp in time_points:
+        tp_df = df_proc[df_proc["Time"]==tp]
+        for feat in feat_cols:
+            t_v = tp_df[tp_df["Treatment"]==treat_lbl][feat].dropna().values
+            c_v = tp_df[tp_df["Treatment"]==ctrl_lbl][feat].dropna().values
+            if len(t_v)>1 and len(c_v)>1:
+                d = cohens_d(t_v, c_v)
+                if not np.isnan(d): effect_data.append({"Time": f"Day {tp}", "Effect": d})
+    effect_df = pd.DataFrame(effect_data) if effect_data else pd.DataFrame()
+
+    mid_time = time_points[len(time_points)//2]
+    vol_rows, sig_features, sig_over_time = [], {}, []
+    for feat in feat_cols:
+        t_v = df_proc[(df_proc["Time"]==mid_time)&(df_proc["Treatment"]==treat_lbl)][feat].dropna().values
+        c_v = df_proc[(df_proc["Time"]==mid_time)&(df_proc["Treatment"]==ctrl_lbl)][feat].dropna().values
+        if len(t_v)>1 and len(c_v)>1:
+            _, p = stats.ttest_ind(t_v, c_v); log2fc = np.mean(t_v)-np.mean(c_v)
+            if not np.isnan(p) and not np.isnan(log2fc): vol_rows.append({"log2FC": log2fc, "pval": p})
+    for tp in time_points[:4]:
+        tp_df = df_proc[df_proc["Time"]==tp]; feats = set()
+        for feat in feat_cols:
+            t_v = tp_df[tp_df["Treatment"]==treat_lbl][feat].dropna().values
+            c_v = tp_df[tp_df["Treatment"]==ctrl_lbl][feat].dropna().values
+            if len(t_v)>1 and len(c_v)>1:
+                _, p = stats.ttest_ind(t_v, c_v)
+                if p < 0.05: feats.add(feat)
+        sig_features[f"Day {tp}"] = feats
+    for tp in time_points:
+        tp_df = df_proc[df_proc["Time"]==tp]; count = 0
+        for feat in feat_cols:
+            t_v = tp_df[tp_df["Treatment"]==treat_lbl][feat].dropna().values
+            c_v = tp_df[tp_df["Treatment"]==ctrl_lbl][feat].dropna().values
+            if len(t_v)>1 and len(c_v)>1:
+                _, p = stats.ttest_ind(t_v, c_v); count += p < 0.05
+        sig_over_time.append(count)
+    print(f"  Significant (treatment, p<0.05): {treat_sig}/{len(feat_cols)}")
+
+    # Figure 1: 4-panel
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle(f"{comp_name.replace('_',' ')} — Treatment Effects Analysis\n(Log₂ + Pareto scaled)",
+                 fontsize=15, fontweight="bold")
+    ax1 = axes[0,0]
+    bars = ax1.bar(["Treatment","Time","Interaction"], [treat_sig,time_sig,interaction_sig],
+                   color=["#FF6B6B","#4ECDC4","#45B7D1"])
+    ax1.set_title("A) Significant Effects (p<0.05)", fontsize=12, fontweight="bold")
+    ax1.set_ylabel("Number of Features", fontsize=11); ax1.grid(True, alpha=0.3, axis="y")
+    for bar, cnt in zip(bars, [treat_sig,time_sig,interaction_sig]):
+        ax1.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.5,
+                 str(cnt), ha="center", va="bottom", fontsize=10)
+    ax2 = axes[0,1]
+    if not effect_df.empty:
+        sns.violinplot(data=effect_df, x="Time", y="Effect", ax=ax2, cut=0)
+        for y, c, lb in [(0,"black",None),(0.2,"red","Small"),(0.5,"orange","Medium"),(0.8,"green","Large")]:
+            ax2.axhline(y, color=c, linestyle="-" if y==0 else "--",
+                        alpha=0.3 if y==0 else 0.5, label=lb)
+        ax2.set_title("B) Effect Sizes by Time Point", fontsize=12, fontweight="bold")
+        ax2.set_ylabel("Effect Size (Cohen's d)", fontsize=11)
+        ax2.legend(fontsize=8); ax2.grid(True, alpha=0.3)
+    ax3 = axes[1,0]
+    if vol_rows:
+        vdf_ov = pd.DataFrame(vol_rows)
+        pt_c = ["#C0392B" if (r["pval"]<0.05 and r["log2FC"]>FC_THRESHOLD)
+                else "#2980B9" if (r["pval"]<0.05 and r["log2FC"]<-FC_THRESHOLD)
+                else "#E67E22" if r["pval"]<0.05 else "#BDC3C7" for _,r in vdf_ov.iterrows()]
+        ax3.scatter(vdf_ov["log2FC"], -np.log10(vdf_ov["pval"]), c=pt_c, alpha=0.6, s=30)
+        ax3.axhline(-np.log10(0.05), color="red", linestyle="--", alpha=0.5)
+        ax3.axvline(FC_THRESHOLD, color="red", linestyle="--", alpha=0.5)
+        ax3.axvline(-FC_THRESHOLD, color="red", linestyle="--", alpha=0.5)
+        ax3.set_xlabel("log₂FC (Pareto-scaled)", fontsize=11); ax3.set_ylabel("-log10(p)", fontsize=11)
+        ax3.set_title(f"C) Volcano Overview: Day {mid_time}", fontsize=12, fontweight="bold")
+        ax3.grid(True, alpha=0.3)
+    ax4 = axes[1,1]
+    tl = list(sig_features.keys()); nn = len(tl)
+    if nn > 0:
+        ov = np.zeros((nn, nn))
+        for i in range(nn):
+            for j in range(nn): ov[i,j] = len(sig_features[tl[i]] & sig_features[tl[j]])
+        sns.heatmap(ov, xticklabels=tl, yticklabels=tl, annot=True, fmt=".0f",
+                    cmap="YlOrRd", ax=ax4, cbar_kws={"label":"Overlap"})
+        ax4.set_title("D) Feature Overlap Between Time Points", fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(f"{out_prefix}_analysis_panels.png", dpi=200, bbox_inches="tight"); plt.close()
+
+    # Figure 2: summary statistics
+    fig2, ax2s = plt.subplots(2, 2, figsize=(14, 10))
+    fig2.suptitle(f"{comp_name.replace('_',' ')} — Summary Statistics (Log₂+Pareto)",
+                  fontsize=14, fontweight="bold")
+    if all_pvals:
+        ax2s[0,0].hist(all_pvals, bins=20, color="steelblue", edgecolor="black", alpha=0.7)
+        ax2s[0,0].axvline(0.05, color="red", linestyle="--", linewidth=2, label="p=0.05")
+        ax2s[0,0].legend()
+    ax2s[0,0].set_xlabel("p-value"); ax2s[0,0].set_ylabel("Frequency")
+    ax2s[0,0].set_title("P-value Distribution"); ax2s[0,0].grid(True, alpha=0.3)
+    sl, sc = [], []
+    for tr in [treat_lbl, ctrl_lbl]:
+        for tp in time_points:
+            sc.append(len(df_proc[(df_proc["Treatment"]==tr)&(df_proc["Time"]==tp)]))
+            sl.append(f"{tr}\nDay{tp}")
+    ax2s[0,1].bar(range(len(sl)), sc, color=["#E74C3C" if treat_lbl in l else "#3498DB" for l in sl])
+    ax2s[0,1].set_xticks(range(len(sl))); ax2s[0,1].set_xticklabels(sl, rotation=45, ha="right", fontsize=8)
+    ax2s[0,1].set_ylabel("Sample Size"); ax2s[0,1].set_title("Sample Distribution")
+    ax2s[0,1].grid(True, alpha=0.3, axis="y")
+    if not effect_df.empty:
+        ae = effect_df["Effect"].abs()
+        ax2s[1,0].bar(["Small\n(<0.2)","Medium\n(0.2–0.5)","Large\n(0.5–0.8)","Very Large\n(>0.8)"],
+                      [(ae<0.2).sum(),((ae>=0.2)&(ae<0.5)).sum(),
+                       ((ae>=0.5)&(ae<0.8)).sum(),(ae>=0.8).sum()],
+                      color=["#90EE90","#FFD700","#FFA500","#FF6347"])
+        ax2s[1,0].set_ylabel("Count"); ax2s[1,0].set_title("Effect Size Distribution")
+        ax2s[1,0].grid(True, alpha=0.3, axis="y")
+    ax2s[1,1].plot(list(map(float, time_points)), sig_over_time, "ro-", linewidth=2, markersize=8)
+    ax2s[1,1].set_xlabel("Time (days)"); ax2s[1,1].set_ylabel("Number of Significant Features")
+    ax2s[1,1].set_title("Significant Features Over Time"); ax2s[1,1].grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"{out_prefix}_summary_statistics.png", dpi=200, bbox_inches="tight"); plt.close()
+    print(f"  ✓ Analysis panels + summary statistics saved")
+    return all_pvals, effect_df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXCEL WORKBOOK (single file per comparison)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_excel(out_path, qc, all_vstats, rf_table, vip_table):
+    with pd.ExcelWriter(out_path, engine="openpyxl") as w:
+        # Preprocessing QC
+        pd.DataFrame([
+            {"Parameter": "Features (raw)",                "Value": qc["features_raw"]},
+            {"Parameter": "Features removed (>40% zeros)", "Value": qc["features_removed"]},
+            {"Parameter": "Features analysed",             "Value": qc["features_kept"]},
+            {"Parameter": "Zeros imputed",                 "Value": qc["zeros_imputed"]},
+            {"Parameter": "Imputation method",             "Value": "Half-minimum per feature"},
+            {"Parameter": "Transformation",                "Value": "Log2"},
+            {"Parameter": "Scaling",                       "Value": "Pareto (divide by sqrt(SD))"},
+            {"Parameter": "Raw data skewness",             "Value": qc["raw_skewness"]},
+            {"Parameter": "Post-processing skewness",      "Value": qc["post_skewness"]},
+            {"Parameter": "FC threshold (log2)",           "Value": FC_THRESHOLD},
+            {"Parameter": "p-value threshold",             "Value": P_THRESHOLD},
+        ]).to_excel(w, sheet_name="Preprocessing_QC", index=False)
+
+        # Volcano summary
+        sr = []
+        for tp, vdf in all_vstats.items():
+            sr.append({"Time_Point": f"Day {tp}", "Total_Features": len(vdf),
+                       "Upregulated": (vdf["class"]=="up").sum(),
+                       "Downregulated": (vdf["class"]=="down").sum(),
+                       "Sig_(low_FC)": (vdf["class"]=="sig_only").sum(),
+                       "Total_Significant": (vdf["class"]!="ns").sum(),
+                       "Not_Significant": (vdf["class"]=="ns").sum()})
+        pd.DataFrame(sr).to_excel(w, sheet_name="Volcano_Summary", index=False)
+
+        # Per time point sheets
+        for tp, vdf in all_vstats.items():
+            out = vdf[["Feature","Name","log2FC","pval","neglog10p","class"]].copy()
+            out.columns = ["Alignment_ID","Metabolite_Name","log2FC","p_value","-log10(p)","Regulation"]
+            out["Regulation"] = out["Regulation"].map(
+                {"up":"Upregulated","down":"Downregulated",
+                 "sig_only":"Significant (low FC)","ns":"Not Significant"})
+            out = out.sort_values("p_value")
+            out.to_excel(w, sheet_name=f"Day{tp}_All", index=False)
+            out[out["Regulation"]=="Upregulated"].to_excel(w, sheet_name=f"Day{tp}_Up", index=False)
+            out[out["Regulation"]=="Downregulated"].to_excel(w, sheet_name=f"Day{tp}_Down", index=False)
+
+        # RF importance — merged into main workbook
+        if rf_table is not None:
+            rf_table.to_excel(w, sheet_name="RF_Importance", index=False)
+
+        # VIP table — merged into main workbook
+        if vip_table is not None:
+            vip_table.to_excel(w, sheet_name="PLSDA_VIP", index=False)
+
+    print(f"  ✓ Excel workbook saved: {out_path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN RUNNER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_comparison(comp_name, cfg):
+    print(f"\n{'='*65}")
+    print(f"  {comp_name}  —  {cfg['treatment_label']} vs {cfg['control_label']}")
+    print(f"{'='*65}\n")
+
+    # Load files
+    df_raw  = load_file(cfg["metabolite_file"])
+    df_meta = load_file(cfg["metadata_file"])
+    df_meta.columns = df_meta.columns.str.strip()
+    df_meta = df_meta.dropna(subset=["Time"]).copy()
+    metadata = {str(r["Sample"]).strip(): (str(r["Treatment"]).strip(), int(r["Time"]))
+                for _, r in df_meta.drop_duplicates(subset="Sample").iterrows()}
+    name_map = dict(zip(df_raw["Alignment ID"],
+                        df_raw.get("Metabolite name", pd.Series("Unknown", index=df_raw.index))))
+    treat_lbl = cfg["treatment_label"]; ctrl_lbl = cfg["control_label"]
+    out_prefix = os.path.join(OUTPUT_DIR, comp_name)
+
+    df, feat_cols = build_sample_dataframe(df_raw, metadata)
+    time_points   = sorted(df["Time"].cat.categories.tolist(), key=float)
+    print(f"✅  {len(feat_cols)} features | time points: {time_points}\n")
+
+    # Preprocessing
+    print("── Preprocessing ──────────────────────────────────────────")
+    df_proc, feat_cols, qc = preprocess(df, feat_cols, comp_name, out_prefix)
+
+    # Statistics + summary figures
+    print("\n── Statistics & summary figures ───────────────────────────")
+    run_statistics_figures(df_proc, feat_cols, time_points, treat_lbl, ctrl_lbl, out_prefix, comp_name)
+
+    # Volcano plots (all time points)
+    print("\n── Volcano plots ───────────────────────────────────────────")
+    all_vstats = {}
+    for tp in time_points:
+        vdf = make_publication_volcano(df_proc, feat_cols, name_map, treat_lbl, ctrl_lbl,
+                                       tp, comp_name.replace("_", " "),
+                                       f"{out_prefix}_volcano_Day{tp}.png")
+        all_vstats[tp] = vdf
+
+    # Feature ranking for advanced analyses
+    feat_pvals = sorted(
+        [(f, stats.ttest_ind(df_proc[df_proc["Treatment"]==treat_lbl][f].dropna().values,
+                              df_proc[df_proc["Treatment"]==ctrl_lbl][f].dropna().values)[1])
+         for f in feat_cols
+         if len(df_proc[df_proc["Treatment"]==treat_lbl][f].dropna()) > 1
+         and len(df_proc[df_proc["Treatment"]==ctrl_lbl][f].dropna()) > 1],
+        key=lambda x: x[1]
+    )
+    top_hm  = [f for f,_ in feat_pvals[:N_TOP_HEATMAP]]
+    top_sig = [f for f,p in feat_pvals if p < P_THRESHOLD]
+    rf_feats = top_sig if len(top_sig) >= 10 else [f for f,_ in feat_pvals[:50]]
+
+    # Heatmap
+    print("\n── Heatmap ─────────────────────────────────────────────────")
+    run_heatmap(df_proc, feat_cols, top_hm, name_map, time_points,
+                treat_lbl, ctrl_lbl, f"{out_prefix}_heatmap.png")
+
+    # Temporal clusters
+    print("\n── Temporal clusters ───────────────────────────────────────")
+    run_temporal_clusters(df_proc, feat_cols, time_points, treat_lbl, ctrl_lbl,
+                          f"{out_prefix}_temporal_clusters.png")
+
+    # Random forest
+    print("\n── Random Forest ───────────────────────────────────────────")
+    rf_table = run_random_forest(df_proc, rf_feats, name_map, treat_lbl, ctrl_lbl, out_prefix)
+
+    # PCA + PLS-DA + permutation test
+    print("\n── PCA & PLS-DA ────────────────────────────────────────────")
+    vip_table = run_pca_plsda(df_proc, feat_cols, name_map, time_points,
+                               treat_lbl, ctrl_lbl, out_prefix, comp_name)
+
+    # Single Excel workbook
+    print("\n── Excel workbook ──────────────────────────────────────────")
+    save_excel(f"{out_prefix}_statistics.xlsx", qc, all_vstats, rf_table, vip_table)
+
+    print(f"\n✅  {comp_name} complete — outputs in: {os.path.abspath(OUTPUT_DIR)}/")
+
+
+if __name__ == "__main__":
+    print(f"\n{'='*65}")
+    print(f"  METABOLOMICS PIPELINE — Meat Quality Study")
+    print(f"  Preprocessing : Filter >40% zeros | Half-min | Log2 | Pareto")
+    print(f"  Analyses      : Volcano · Heatmap · Temporal · RF · PCA · PLS-DA")
+    print(f"{'='*65}")
+
+    failed = []
+    for comp_name, cfg in COMPARISONS.items():
+        try:
+            run_comparison(comp_name, cfg)
+        except FileNotFoundError as e:
+            print(e)
+            print(f"  ⏭  Skipping '{comp_name}' — update the file path and re-run.\n")
+            failed.append(comp_name)
+        except Exception as e:
+            import traceback
+            print(f"  ❌ Error in '{comp_name}': {e}")
+            traceback.print_exc()
+            failed.append(comp_name)
+
+    ran = [c for c in COMPARISONS if c not in failed]
+    print(f"\n{'='*65}")
+    print(f"  ✅  Completed : {ran}")
+    if failed:
+        print(f"  ⚠   Skipped  : {failed}")
+    print(f"  📁  Outputs   : {os.path.abspath(OUTPUT_DIR)}/")
+    print(f"{'='*65}")
+
